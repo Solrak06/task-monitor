@@ -1,0 +1,1 @@
+{ "name": "task-monitor", "version": "0.1.0", "description": "Opens a CPU/RAM monitor window for Claude Code tasks whenever you send a prompt" }
