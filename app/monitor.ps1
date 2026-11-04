@@ -659,12 +659,16 @@ namespace TaskMon {
   public class DiaryTurn {
     public DateTime Start; public DateTime End; public string Text = "";
     public List<string> Files = new List<string>(); public int Commands, Agents, Tools;
-    public string When { get; set; } public string Prompt { get; set; } public string Detail { get; set; }
+    // Solo para enseñar (no van al archivo de caché)
+    [ScriptIgnore] public string When { get; set; } [ScriptIgnore] public string Prompt { get; set; } [ScriptIgnore] public string Detail { get; set; }
+    [ScriptIgnore] public string Tip { get; set; }
+    [ScriptIgnore] public string Sid, Cwd;
   }
   public class DiarySession {
     public string Id { get; set; } public string Title { get; set; } public string Cwd { get; set; } public string Folder { get; set; }
     public DateTime Last { get; set; } public string LastText { get; set; } public string Summary { get; set; }
     public string Color { get; set; } public bool Open { get; set; } public bool IsExpanded { get; set; }
+    public bool Auto { get; set; }                  // lanzada por un programa (claude -p), no escrita por ti
     public List<DiaryTurn> Turns { get; set; }
     public string Key { get; set; }                 // sesión + día, para recordar qué está abierto
     public List<DiaryTurn> Raw = new List<DiaryTurn>();
@@ -672,11 +676,13 @@ namespace TaskMon {
   // Un día del diario: su subtítulo y las sesiones con lo que hicieron ese día
   public class DiaryDay {
     public string Header { get; set; } public string Sub { get; set; }
+    public string Stats { get; set; } public Geometry Hours { get; set; } public string HoursTip { get; set; }
     public List<DiarySession> Sessions { get; set; }
+    public DateTime Date;
   }
   // Lo leído de cada registro: hasta dónde y qué peticiones salieron. Se guarda en disco para no releer nunca lo mismo.
   public class DiaryFile {
-    public long Offset; public long Length; public string Id, Title, Custom, Cwd;
+    public long Offset; public long Length; public string Id, Title, Custom, Cwd, Ep;
     public List<DiaryTurn> Turns = new List<DiaryTurn>();
     [ScriptIgnore] public DiaryTurn Cur;
   }
@@ -693,6 +699,7 @@ namespace TaskMon {
     static readonly Regex rePath = new Regex("\"(?:file_path|notebook_path)\":\"((?:[^\"\\\\]|\\\\.)*)\"");
     static readonly Regex reTime = new Regex("\"timestamp\":\"([^\"]+)\"");
     static readonly Regex reCwd = new Regex("\"cwd\":\"((?:[^\"\\\\]|\\\\.)*)\"");
+    static readonly Regex reEp = new Regex("\"entrypoint\":\"([^\"]+)\"");
     static readonly JavaScriptSerializer js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 64 };
 
     public static Task<List<DiarySession>> LoadAsync(string root, string cacheFile, int days) { return Task.Run(() => Load(root, cacheFile, days)); }
@@ -713,6 +720,7 @@ namespace TaskMon {
               try { Read(f, st); } catch { }
               st.Length = fi.Length; changed = true;
             }
+            if (st.Ep == null && st.Turns.Count > 0) { st.Ep = PeekEp(f); changed = true; }
             if (st.Turns.Count > 0) list.Add(Snapshot(st, since));
           }
         if (changed) WriteCache(cacheFile);
@@ -780,6 +788,19 @@ namespace TaskMon {
         st.Offset = lineStart;   // una línea a medio escribir se lee la próxima vez
       }
     }
+    // Quién abrió la sesión (cli = tú en una terminal; sdk-cli = un programa con claude -p): va al final de cada línea
+    static string PeekEp(string path) {
+      try {
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+          int n = (int)Math.Min(fs.Length, 65536);
+          fs.Seek(-n, SeekOrigin.End);
+          var b = new byte[n]; int got = 0, r;
+          while (got < n && (r = fs.Read(b, got, n - got)) > 0) got += r;
+          var m = reEp.Match(Encoding.UTF8.GetString(b, 0, got));
+          return m.Success ? m.Groups[1].Value : "";
+        }
+      } catch { return ""; }
+    }
     static int IndexOf(byte[] a, int from, int to, byte[] p) {
       for (int i = from; i <= to - p.Length; i++) {
         if (a[i] != p[0]) continue;
@@ -846,6 +867,7 @@ namespace TaskMon {
       if (tm.Count > 0 && DateTime.TryParse(tm[tm.Count - 1].Groups[1].Value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out ts)) ts = ts.ToLocalTime();
       var cm = reCwd.Match(tail);
       if (cm.Success) st.Cwd = Unescape(cm.Groups[1].Value);
+      if (st.Ep == null) { var em = reEp.Match(tail); if (em.Success) st.Ep = em.Groups[1].Value; }
       var cur = st.Cur;
       if (user) {
         // Las líneas enormes (capturas pegadas) también son peticiones: solo se descartan las absurdas
@@ -899,14 +921,22 @@ namespace TaskMon {
       if (t.Date == DateTime.Today.AddDays(-1)) return "ayer " + t.ToString("HH:mm");
       return t.ToString("d MMM HH:mm", es);
     }
+    // /c/Users/... (rutas de Git Bash) -> C:\Users\...
+    static string WinPath(string p) {
+      if (string.IsNullOrEmpty(p)) return "";
+      if (p.Length >= 3 && p[0] == '/' && char.IsLetter(p[1]) && p[2] == '/') return char.ToUpper(p[1]) + ":\\" + p.Substring(3).Replace('/', '\\');
+      return p;
+    }
+    static bool Has(string a, string q) { return a != null && es.CompareInfo.IndexOf(a, q, CompareOptions.IgnoreCase | CompareOptions.IgnoreNonSpace) >= 0; }
     static string Dur(TimeSpan d) {
       if (d.TotalMinutes < 1) return "<1 min";
       if (d.TotalHours < 1) return (int)d.TotalMinutes + " min";
       return (int)d.TotalHours + " h " + d.Minutes.ToString("00") + " min";
     }
     static DiarySession Snapshot(DiaryFile st, DateTime since) {
-      var s = new DiarySession { Id = st.Id, Title = st.Custom ?? st.Title, Cwd = st.Cwd ?? "", Color = "#5F6775" };
-      s.Folder = string.IsNullOrEmpty(s.Cwd) ? "" : s.Cwd;
+      var s = new DiarySession { Id = st.Id, Title = st.Custom ?? st.Title, Cwd = WinPath(st.Cwd), Color = "#5F6775" };
+      s.Auto = st.Ep != null && st.Ep.StartsWith("sdk");
+      s.Folder = s.Cwd;
       if (string.IsNullOrEmpty(s.Title)) s.Title = string.IsNullOrEmpty(s.Cwd) ? st.Id : Path.GetFileName(s.Cwd.TrimEnd('\\'));
       for (int i = st.Turns.Count - 1; i >= 0; i--) {
         if (st.Turns[i].End < since) break;
@@ -938,24 +968,38 @@ namespace TaskMon {
         if (t.Agents > 0) parts.Add(t.Agents + (t.Agents == 1 ? " subagente" : " subagentes"));
         if (parts.Count == 0) parts.Add(t.Tools > 0 ? "consultó " + t.Tools + (t.Tools == 1 ? " cosa" : " cosas") + ", sin cambios" : "solo respondió");
         parts.Add(Dur(t.End - t.Start));
-        s.Turns.Add(new DiaryTurn { Start = t.Start, End = t.End, When = t.Start.ToString("HH:mm"), Prompt = first.Length > 220 ? first.Substring(0, 220) + "…" : first, Detail = string.Join("  ·  ", parts.ToArray()) });
+        string detail = string.Join("  ·  ", parts.ToArray());
+        var tip = new StringBuilder(t.Text.Trim());
+        if (t.Files.Count > 0) {
+          tip.Append("\n\nArchivos editados:");
+          for (int i = 0; i < Math.Min(12, t.Files.Count); i++) tip.Append("\n  ").Append(t.Files[i]);
+          if (t.Files.Count > 12) tip.Append("\n  … y ").Append(t.Files.Count - 12).Append(" más");
+        }
+        tip.Append("\n\n").Append(t.Start.ToString("HH:mm")).Append("–").Append(t.End.ToString("HH:mm")).Append("  ·  ").Append(detail);
+        s.Turns.Add(new DiaryTurn { Start = t.Start, End = t.End, Text = t.Text, Files = t.Files, Commands = t.Commands, Sid = s.Id, Cwd = s.Cwd,
+          When = t.Start.ToString("HH:mm"), Prompt = first.Length > 220 ? first.Substring(0, 220) + "…" : first, Detail = detail, Tip = tip.ToString() });
       }
       s.Summary = count + (count == 1 ? " petición" : " peticiones") + "  ·  " + files.Count + (files.Count == 1 ? " archivo" : " archivos") + "  ·  " + cmds + " comandos  ·  " + Dur(work) + " trabajando";
     }
 
     // El diario por días: cada sesión sale en cada día en que le pediste algo, solo con lo de ese día.
     // Las sesiones llegan ya en el orden en que se enseñan (abiertas primero, luego por actividad).
-    public static List<DiaryDay> ByDay(System.Collections.IEnumerable sessions) {
+    public static List<DiaryDay> ByDay(System.Collections.IEnumerable sessions, string query, int dayCount) {
+      DateTime from = DateTime.Today.AddDays(1 - Math.Max(1, dayCount));
+      string q = string.IsNullOrWhiteSpace(query) ? null : query.Trim();
       var byDate = new SortedDictionary<DateTime, List<DiarySession>>();
       foreach (DiarySession s in sessions) {
+        bool whole = q == null || Has(s.Title, q) || Has(s.Folder, q);
         var parts = new Dictionary<DateTime, List<DiaryTurn>>();
         foreach (var t in s.Raw) {
+          if (t.Start < from) continue;
+          if (!whole && !Has(t.Text, q) && !t.Files.Exists(f => Has(f, q))) continue;
           List<DiaryTurn> l;
           if (!parts.TryGetValue(t.Start.Date, out l)) { l = new List<DiaryTurn>(); parts[t.Start.Date] = l; }
           l.Add(t);
         }
         foreach (var kv in parts) {
-          var d = new DiarySession { Id = s.Id, Title = s.Title, Cwd = s.Cwd, Folder = s.Folder, Color = s.Color, Open = s.Open, Key = s.Id + "|" + kv.Key.ToString("yyyyMMdd") };
+          var d = new DiarySession { Id = s.Id, Title = s.Title, Cwd = s.Cwd, Folder = s.Folder, Color = s.Color, Open = s.Open, Auto = s.Auto, Key = s.Id + "|" + kv.Key.ToString("yyyyMMdd") };
           d.Raw = kv.Value;
           d.Last = kv.Value[0].Start;
           d.LastText = (kv.Value.Count == 1 ? "a las " : "última a las ") + d.Last.ToString("HH:mm");
@@ -970,14 +1014,59 @@ namespace TaskMon {
         var list = kv.Value;
         // Las abiertas primero y, dentro, la que trabajó más tarde ese día
         list.Sort((a, b) => a.Open != b.Open ? (a.Open ? -1 : 1) : b.Last.CompareTo(a.Last));
-        int n = 0;
-        foreach (var s in list) n += s.Raw.Count;
+        int n = 0, cmds = 0; var work = TimeSpan.Zero;
+        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var hours = new double[24];
+        foreach (var s in list) foreach (var t in s.Raw) {
+          n++; cmds += t.Commands; work += t.End - t.Start;
+          foreach (var f in t.Files) files.Add(f);
+          // Los minutos de trabajo de cada petición, repartidos por las horas en que ocurrieron
+          var a = t.Start; var end = t.End > t.Start.AddMinutes(1) ? t.End : t.Start.AddMinutes(1);
+          if (end.Date > a.Date) end = a.Date.AddDays(1);
+          while (a < end) {
+            var next = a.Date.AddHours(a.Hour + 1); if (next > end) next = end;
+            hours[a.Hour] += (next - a).TotalMinutes; a = next;
+          }
+        }
         string name = kv.Key.ToString("dddd d 'de' MMMM", es);
         string header = kv.Key == DateTime.Today ? "Hoy · " + name : kv.Key == DateTime.Today.AddDays(-1) ? "Ayer · " + name : char.ToUpper(name[0]) + name.Substring(1);
-        days.Insert(0, new DiaryDay { Header = header, Sessions = list,
+        int peak = 0; for (int h = 1; h < 24; h++) if (hours[h] > hours[peak]) peak = h;
+        days.Insert(0, new DiaryDay { Header = header, Sessions = list, Date = kv.Key, Hours = Bars(hours),
+          HoursTip = "Cuándo trabajó Claude ese día (minutos por hora). Hora con más trabajo: " + peak.ToString("00") + ":00–" + (peak + 1).ToString("00") + ":00 (" + (int)Math.Round(hours[peak]) + " min)",
+          Stats = Dur(work) + " trabajando  ·  " + files.Count + (files.Count == 1 ? " archivo" : " archivos") + "  ·  " + cmds + (cmds == 1 ? " comando" : " comandos"),
           Sub = list.Count + (list.Count == 1 ? " sesión" : " sesiones") + "  ·  " + n + (n == 1 ? " petición" : " peticiones") });
       }
       return days;
+    }
+    // 24 barras (una por hora) de 7 px con 2 px de hueco: 216 x 16
+    static Geometry Bars(double[] v) {
+      double max = 0; foreach (var x in v) max = Math.Max(max, x);
+      var g = new StreamGeometry();
+      using (var c = g.Open()) {
+        for (int i = 0; i < 24; i++) {
+          if (v[i] <= 0) continue;
+          double h = Math.Max(2.0, v[i] / max * 16), x = i * 9;
+          c.BeginFigure(new Point(x, 16 - h), true, true);
+          c.LineTo(new Point(x + 7, 16 - h), false, false); c.LineTo(new Point(x + 7, 16), false, false); c.LineTo(new Point(x, 16), false, false);
+        }
+      }
+      g.Freeze();
+      return g;
+    }
+    // El día en texto para pegar (un parte de trabajo): cada sesión con sus peticiones
+    public static string DayText(DiaryDay d) {
+      var sb = new StringBuilder();
+      sb.Append("## ").Append(d.Header).Append("\r\n").Append(d.Sub.Replace("  ·  ", " · ")).Append(" · ").Append(d.Stats.Replace("  ·  ", " · ")).Append("\r\n");
+      foreach (var s in d.Sessions) {
+        sb.Append("\r\n### ").Append(s.Title);
+        if (!string.IsNullOrEmpty(s.Folder)) sb.Append("  (").Append(s.Folder).Append(")");
+        sb.Append("\r\n");
+        for (int i = s.Turns.Count - 1; i >= 0; i--) {
+          var t = s.Turns[i];
+          sb.Append("- ").Append(t.When).Append("  ").Append(t.Prompt).Append("  — ").Append(t.Detail.Replace("  ·  ", " · ")).Append("\r\n");
+        }
+      }
+      return sb.ToString();
     }
   }
 
@@ -1283,12 +1372,12 @@ New-Item -ItemType Directory -Force -Path $sessionDir | Out-Null
 $cores = [Environment]::ProcessorCount
 $historyLen = 50
 $taskHistoryLen = 30
-$version = '1.5'
+$version = '1.6'
 
 # --- Ajustes y datos persistentes -------------------------------------------------
 $defaults = [ordered]@{
   style = 'hacker'; theme = 'matrix'; openMode = 'always'; ramThreshold = 80; refreshSec = 2; reservePct = 15
-  crt = $true; soundCritical = $false; soundDone = $false; topmost = $false; nefFondo = 'angel_caido'; sprites = $true; fixedSize = $false; fixedBounds = $null; groupMode = 'pinned'; sortMode = 'opened'; diaryScope = 'open'; dockTerminal = $false; stage = 'gym'; homeTab = 'tasks'; renderAutoNext = $false
+  crt = $true; soundCritical = $false; soundDone = $false; topmost = $false; sprites = $true; fixedSize = $false; fixedBounds = $null; groupMode = 'pinned'; sortMode = 'opened'; diaryScope = 'open'; diaryDays = 7; diaryAuto = $false; softRender = $true; forjaRoot = ''; dockTerminal = $false; stage = 'gym'; homeTab = 'tasks'; renderAutoNext = $false
 }
 function Read-Json($path) {
   if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json }
@@ -1733,19 +1822,15 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
       </Setter>
     </Style>
 
-    <!-- Tarjeta de un render (compacta, como las de Claude Tasks): portada del canal, título del mp4, dos barras en una fila y una línea de estado -->
+    <!-- Tarjeta de un render (compacta, como las de Claude Tasks): icono del motor, título del vídeo, dos barras en una fila y una línea de estado -->
     <DataTemplate x:Key="RenderCard">
                 <Border x:Name="Card" Background="{Binding [CardBg]}" BorderBrush="{DynamicResource Line}" BorderThickness="1" CornerRadius="{DynamicResource Radius}" Margin="{DynamicResource CardGap}" ToolTip="{Binding [Tip]}" Cursor="Hand">
                   <Grid>
                     <Grid.ColumnDefinitions><ColumnDefinition Width="3"/><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
                     <Border Background="{Binding [StateColor]}" CornerRadius="2,0,0,2"/>
                     <Grid Grid.Column="1" Width="47" Height="47" Margin="8,0,0,0" VerticalAlignment="Center">
-                      <Border CornerRadius="5" BorderBrush="{Binding [StateColor]}" BorderThickness="1.5" Background="{DynamicResource SpriteBg}">
-                        <Image Source="{Binding [Cover]}" Stretch="UniformToFill" Width="44" Height="44" RenderOptions.BitmapScalingMode="HighQuality">
-                          <Image.Clip><RectangleGeometry Rect="0,0,44,44" RadiusX="4" RadiusY="4"/></Image.Clip>
-                        </Image>
-                      </Border>
-                      <TextBlock Text="{Binding [Glyph]}" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="18" Foreground="{Binding [StateColor]}" HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="{Binding [GlyphVis]}"/>
+                      <Border CornerRadius="5" BorderBrush="{Binding [StateColor]}" BorderThickness="1.5" Background="{DynamicResource SpriteBg}"/>
+                      <TextBlock Text="{Binding [Glyph]}" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="18" Foreground="{Binding [StateColor]}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                       <Border CornerRadius="5" Background="#99000000" Visibility="{Binding [OverlayVis]}">
                         <TextBlock Text="{Binding [Overlay]}" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="16" Foreground="{Binding [StateColor]}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                       </Border>
@@ -1811,15 +1896,8 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
         <RowDefinition Height="24"/>
       </Grid.RowDefinitions>
 
-      <!-- Fondo ilustrado (estilo Nefralis) -->
-      <Rectangle x:Name="BgImage" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed"/>
-      <Rectangle x:Name="BgVeil" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed">
-        <Rectangle.Fill>
-          <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-            <GradientStop Color="#1F000000" Offset="0"/><GradientStop Color="#14000000" Offset="0.4"/><GradientStop Color="#80000000" Offset="1"/>
-          </LinearGradientBrush>
-        </Rectangle.Fill>
-      </Rectangle>
+      <!-- Fondo liso del tema (los estilos con resplandor lo pintan encima) -->
+      <Rectangle Grid.Row="1" Grid.RowSpan="2" Fill="{DynamicResource Bg}" IsHitTestVisible="False"/>
       <Rectangle x:Name="BgGlow" Grid.Row="1" Grid.RowSpan="2" Visibility="Collapsed" IsHitTestVisible="False">
         <Rectangle.Fill>
           <RadialGradientBrush Center="0.5,0" GradientOrigin="0.5,0" RadiusX="0.8" RadiusY="0.45">
@@ -2067,7 +2145,7 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
             </ItemsControl>
           </Border>
           <Border Style="{StaticResource Plate}" Margin="0,4,0,0"><TextBlock Style="{StaticResource Muted}" FontSize="10" TextWrapping="Wrap"
-                     Text="Salen los renders con progreso (Remotion), Blender en segundo plano, ffmpeg, HandBrake y Media Encoder, los Blender que esperan turno y la cola de vídeos de FORJA. Clic derecho: pausar, reanudar, abrir su carpeta, portada, cancelar… Doble clic: abre su carpeta."/></Border>
+                     Text="Salen los renders con progreso (Remotion), Blender en segundo plano, ffmpeg, HandBrake y Media Encoder, los Blender que esperan turno y la cola de vídeos de FORJA. Clic derecho: pausar, reanudar, abrir su carpeta, cancelar… Doble clic: abre su carpeta."/></Border>
         </StackPanel>
       </ScrollViewer>
 
@@ -2159,6 +2237,21 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
             <TextBlock Text="Diario" Foreground="{DynamicResource Bright}" FontSize="18" FontWeight="Bold"/>
             <TextBlock x:Name="DiarySummary" Style="{StaticResource Muted}" Margin="0,2,0,8" TextWrapping="Wrap"/>
             <WrapPanel x:Name="DiaryScope"/>
+            <WrapPanel x:Name="DiaryRange"/>
+            <DockPanel Margin="0,2,0,6">
+              <CheckBox x:Name="DiaryAutoChk" DockPanel.Dock="Right" Style="{StaticResource TermCheck}" Content="claude -p" Margin="10,0,0,0" VerticalAlignment="Center"
+                        ToolTip="Incluir las sesiones que abren otros programas con claude -p (pipelines, scripts...). Sin marcar solo salen las que escribiste tú."/>
+              <Border BorderBrush="{DynamicResource Line}" BorderThickness="1" CornerRadius="{DynamicResource Radius}" Background="{DynamicResource Panel}" Padding="8,4">
+                <DockPanel>
+                  <TextBlock DockPanel.Dock="Left" Text="&#xE721;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="11" Foreground="{DynamicResource Dim}" VerticalAlignment="Center" Margin="0,0,7,0"/>
+                  <Grid>
+                    <TextBlock x:Name="DiaryHint" Text="Buscar en peticiones, archivos o sesiones" Foreground="{DynamicResource Dim}" FontSize="11.5" VerticalAlignment="Center" IsHitTestVisible="False" TextTrimming="CharacterEllipsis"/>
+                    <TextBox x:Name="DiarySearch" Background="Transparent" BorderThickness="0" Foreground="{DynamicResource Bright}" CaretBrush="{DynamicResource Accent}"
+                             SelectionBrush="{DynamicResource Deep}" FontSize="11.5" FontFamily="{DynamicResource UiFont}" VerticalAlignment="Center" Padding="0"/>
+                  </Grid>
+                </DockPanel>
+              </Border>
+            </DockPanel>
           </StackPanel>
           <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="14,4,10,10">
             <StackPanel>
@@ -2167,13 +2260,38 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
                 <ItemsControl.ItemTemplate>
                   <DataTemplate>
                    <StackPanel Margin="0,0,0,6">
-                    <DockPanel Margin="0,4,0,8">
+                    <DockPanel Margin="0,4,0,4">
                       <Border Style="{StaticResource Plate}">
                         <TextBlock Text="{Binding Header}" FontWeight="Bold" Foreground="{DynamicResource Bright}"/>
                       </Border>
+                      <Button DockPanel.Dock="Right" Tag="daycopy" Cursor="Hand" Margin="4,0,0,0" VerticalAlignment="Center" ToolTip="Copiar el resumen de este día (texto para pegar en un parte o una nota)">
+                        <Button.Template>
+                          <ControlTemplate TargetType="Button">
+                            <Border x:Name="Bd" Background="Transparent" CornerRadius="4" Padding="5,3">
+                              <TextBlock Text="&#xE8C8;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="11" Foreground="{DynamicResource Soft}"/>
+                            </Border>
+                            <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Bd" Property="Background" Value="{DynamicResource AccentSoft}"/></Trigger></ControlTemplate.Triggers>
+                          </ControlTemplate>
+                        </Button.Template>
+                      </Button>
                       <TextBlock DockPanel.Dock="Right" Text="{Binding Sub}" Style="{StaticResource Muted}" FontSize="10" VerticalAlignment="Center" Margin="8,0,0,0"/>
                       <Rectangle Height="1" Margin="8,0,0,0" VerticalAlignment="Center" Fill="{DynamicResource GroupLine}"/>
                     </DockPanel>
+                    <StackPanel Margin="2,0,2,10" ToolTip="{Binding HoursTip}" Background="Transparent">
+                      <TextBlock Text="{Binding Stats}" Style="{StaticResource Muted}" FontSize="10.5" Margin="0,0,0,4" TextTrimming="CharacterEllipsis"/>
+                      <Viewbox Stretch="Fill" Height="16">
+                        <Grid Width="216" Height="16">
+                          <Rectangle Height="1" VerticalAlignment="Bottom" Fill="{DynamicResource GroupLine}"/>
+                          <Path Data="{Binding Hours}" Fill="{DynamicResource Accent}" Opacity="0.85"/>
+                        </Grid>
+                      </Viewbox>
+                      <UniformGrid Columns="4" Margin="0,1,0,0">
+                        <TextBlock Text="0h" FontSize="9" Foreground="{DynamicResource Dim}"/>
+                        <TextBlock Text="6h" FontSize="9" Foreground="{DynamicResource Dim}"/>
+                        <TextBlock Text="12h" FontSize="9" Foreground="{DynamicResource Dim}"/>
+                        <TextBlock Text="18h" FontSize="9" Foreground="{DynamicResource Dim}"/>
+                      </UniformGrid>
+                    </StackPanel>
                     <ItemsControl ItemsSource="{Binding Sessions}">
                      <ItemsControl.ItemTemplate>
                       <DataTemplate>
@@ -2193,7 +2311,7 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
                         <ItemsControl ItemsSource="{Binding Turns}" Margin="12,0,12,10">
                           <ItemsControl.ItemTemplate>
                             <DataTemplate>
-                              <Grid Margin="0,7,0,0">
+                              <Grid Margin="0,7,0,0" Background="Transparent" ToolTip="{Binding Tip}" ToolTipService.ShowDuration="60000">
                                 <Grid.ColumnDefinitions><ColumnDefinition Width="48"/><ColumnDefinition/></Grid.ColumnDefinitions>
                                 <TextBlock Text="{Binding When}" Style="{StaticResource Muted}" FontSize="10.5" FontFamily="{DynamicResource NumFont}" Margin="4,1,0,0"/>
                                 <Border Grid.Column="1" BorderBrush="{DynamicResource Deep}" BorderThickness="2,0,0,0" Padding="9,0,0,0">
@@ -2241,11 +2359,6 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
                 <WrapPanel x:Name="ThemeOpts"/>
                 <CheckBox x:Name="CrtChk" Style="{StaticResource TermCheck}" Content="Efecto CRT (líneas de barrido y viñeta)" Margin="0,4,0,0"/>
               </StackPanel>
-              <StackPanel x:Name="NefOpts" Margin="0,10,0,4">
-                <TextBlock Text="Opciones del estilo Nefralis" Foreground="{DynamicResource Bright}" FontWeight="SemiBold" Margin="0,0,0,6"/>
-                <TextBlock Text="Fondo" Foreground="{DynamicResource Soft}" Margin="0,0,0,4"/>
-                <WrapPanel x:Name="NefFondoOpts"/>
-              </StackPanel>
               <Border Height="8"/>
               <CheckBox x:Name="SpritesChk" Style="{StaticResource TermCheck}" Content="Claudes animados en pixel art en cada sesión (cada estado tiene varias escenas)"/>
               <Button x:Name="GalleryBtn" Style="{StaticResource TermBtn}" Content="Ver todas las animaciones de Claude por estado" HorizontalAlignment="Left" Margin="22,4,0,6"/>
@@ -2272,6 +2385,7 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
               <CheckBox x:Name="SoundDoneChk" Style="{StaticResource TermCheck}" Content="Sonido cuando una sesión termina su tarea"/>
               <CheckBox x:Name="TopChk" Style="{StaticResource TermCheck}" Content="Ventana siempre visible (encima de las demás)"/>
               <CheckBox x:Name="DockChk" Style="{StaticResource TermCheck}" Content="Acoplar con Windows Terminal: el monitor pegado a la derecha con el ancho mínimo y toda la altura, y la Terminal ocupando el resto a la izquierda. Mientras esté activado no se pueden mover ni cambiar de tamaño"/>
+              <CheckBox x:Name="SoftChk" Style="{StaticResource TermCheck}" Content="Modo ligero: sin tarjeta gráfica (~80 MB menos de RAM)" ToolTip="Dibuja la ventana por software: el driver de la gráfica deja de reservar ~80-90 MB. Cuesta ~1 % más de CPU de un núcleo."/>
               <CheckBox x:Name="FixedChk" Style="{StaticResource TermCheck}" Content="Tamaño fijo: deja la ventana como quieras y actívalo para que se quede con ese tamaño"/>
 
               <TextBlock Text="SOBRE PAUSAR" Style="{StaticResource Section}"/>
@@ -2304,7 +2418,7 @@ function Level-Color([double]$pct) { @($ok, $warn, $crit)[(Level $pct)] }
 </Window>
 '@
 
-# Ojo: el dibujado por software ahorraba ~40 MB pero subía la CPU del 2 % a más del 20 % de un núcleo; se queda en la gráfica
+# Modo ligero (por defecto): la ventana se dibuja por software. Con la tarjeta gráfica su driver reserva ~80-90 MB más.
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $ui = @{}
 $xaml.SelectNodes('//*[@*[local-name()="Name"]]') | ForEach-Object { $n = $window.FindName($_.Name); if ($n) { $ui[$_.Name] = $n } }
@@ -2506,8 +2620,23 @@ function Draw-Graph([string]$key, $canvas, $line, $area, $dots, $head, $values, 
 
 $logItems = New-Object System.Collections.ObjectModel.ObservableCollection[object]
 $ui.Log.ItemsSource = $logItems
+$logFile = Join-Path $dataDir 'actividad.log'
+# El registro en disco no crece sin límite: pasado 1 MB se queda con los últimos ~256 KB
+function Trim-LogFile {
+  try {
+    $fi = New-Object IO.FileInfo $logFile
+    if (-not $fi.Exists -or $fi.Length -le 1MB) { return }
+    $fs = [IO.File]::Open($logFile, 'Open', 'Read', 'ReadWrite'); $keep = [Math]::Min($fs.Length, 256KB)
+    [void]$fs.Seek(-$keep, 'End'); $buf = New-Object byte[] $keep; [void]$fs.Read($buf, 0, $keep); $fs.Close()
+    $text = [Text.Encoding]::UTF8.GetString($buf); $text = $text.Substring($text.IndexOf("`n") + 1)
+    [IO.File]::WriteAllText($logFile, $text, (New-Object Text.UTF8Encoding $false))
+  } catch {}
+}
+Trim-LogFile
+$logWrites = 0
 function Log([string]$text, [string]$color = '') {
-  try { [IO.File]::AppendAllText((Join-Path $dataDir 'actividad.log'), "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) $text`r`n") } catch {}
+  try { [IO.File]::AppendAllText($logFile, "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) $text`r`n", [Text.Encoding]::UTF8) } catch {}
+  if ((++$script:logWrites) % 200 -eq 0) { Trim-LogFile }
   if (-not $color) { $color = $theme.Accent }
   $logItems.Add([pscustomobject]@{ Time = (Get-Date).ToString('HH:mm:ss  '); Text = $text; Color = $color })
   while ($logItems.Count -gt 80) { $logItems.RemoveAt(0) }
@@ -2577,7 +2706,6 @@ function Apply-Style {
   $ui.CpuDelta.Visibility = $(if ($style.Delta) { 'Visible' } else { 'Collapsed' }); $ui.RamDelta.Visibility = $ui.CpuDelta.Visibility
   $ui.HackerOpts.Visibility = $(if ($isHacker) { 'Visible' } else { 'Collapsed' })
   $isNef = $settings.style -eq 'nefralis'
-  $ui.NefOpts.Visibility = $(if ($isNef) { 'Visible' } else { 'Collapsed' })
   $window.Resources['Plate'] = [System.Windows.Media.Brush](Brush $(if ($isNef) { '#8C000000' } else { '#00000000' }))
   $window.Resources['PlatePad'] = [System.Windows.Thickness]::new($(if ($isNef) { 8 } else { 0 }), $(if ($isNef) { 3 } else { 0 }), $(if ($isNef) { 8 } else { 0 }), $(if ($isNef) { 3 } else { 0 }))
   $window.Resources['PlateBarVis'] = [System.Windows.Visibility]$(if ($isNef) { 'Visible' } else { 'Collapsed' })
@@ -2593,19 +2721,9 @@ function Apply-Style {
   $ui.AdviceMedal.Visibility = $ui.BgGlow.Visibility; $ui.NoTasksMedal.Visibility = $ui.BgGlow.Visibility
   $ui.PlainTitle.FontSize = $(if ($isNef) { 12 } else { 13 }); $ui.PlainTitle.FontWeight = $(if ($isNef) { 'Bold' } else { 'SemiBold' })
   $ui.AccentLine.Visibility = $(if ($isNef) { 'Visible' } else { 'Collapsed' })
-  $ui.BgVeil.Visibility = $(if ($isNef) { 'Visible' } else { 'Collapsed' })
-  $ui.BgImage.Visibility = $ui.BgVeil.Visibility
   $ui.TitleIcon.Visibility = $(if ($isNef) { 'Collapsed' } else { 'Visible' })
   $ui.NefIcon.Visibility = $(if ($isNef) { 'Visible' } else { 'Collapsed' })
   if ($isNef) {
-    $img = Join-Path $assetDir "nefralis-$($settings.nefFondo).jpg"
-    if (-not (Test-Path -LiteralPath $img)) { $img = Join-Path $assetDir 'nefralis-estatua.jpg' }
-    $bi = Load-Image $img
-    if ($bi) {
-      $brush = New-Object System.Windows.Media.ImageBrush $bi
-      $brush.Stretch = 'UniformToFill'; $brush.AlignmentY = 'Top'; $brush.Freeze()
-      $ui.BgImage.Fill = $brush
-    } else { $ui.BgImage.Fill = $null }
     $ui.CpuMark.Source = Asset-Image 'icon-entrenamiento.png'; $ui.RamMark.Source = Asset-Image 'icon-record.png'
     $ui.NoTasksIcon.Source = Asset-Image 'icon-vacio.png'
 
@@ -2614,7 +2732,6 @@ function Apply-Style {
     # Subtítulos como en Nefralis: texto claro en mayúsculas sobre placa oscura, con la barrita del acento
     foreach ($tag in $ui.TasksTag, $ui.OthersTag, $ui.RenderTag, $ui.RenderWaitTag, $ui.RenderPausedTag, $ui.RenderDoneTag, $ui.RenderOthersTag) { $tag.Foreground = Brush $palette.Bright; $tag.FontSize = 12 }
   } else {
-    $ui.BgImage.Fill = $null
 
     foreach ($tag in $ui.TasksTag, $ui.OthersTag, $ui.RenderTag, $ui.RenderWaitTag, $ui.RenderPausedTag, $ui.RenderDoneTag, $ui.RenderOthersTag) { $tag.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, 'Accent'); $tag.FontSize = 11 }
   }
@@ -2628,6 +2745,11 @@ function Apply-Style {
 }
 Apply-Style
 $window.Add_SourceInitialized({ Apply-Style })
+function Apply-RenderMode {
+  $src = [System.Windows.Interop.HwndSource]::FromVisual($window)
+  if ($src) { $src.CompositionTarget.RenderMode = $(if ($settings.softRender) { 'SoftwareOnly' } else { 'Default' }) }
+}
+$window.Add_SourceInitialized({ Apply-RenderMode })
 
 # --- Pausa / reanudar -------------------------------------------------------------
 $treeOf = @{}          # pid raíz -> pids de su árbol que se pueden congelar (última lectura)
@@ -2826,8 +2948,9 @@ $iconFont = [System.Windows.Media.FontFamily]::new('Segoe Fluent Icons, Segoe MD
 $menuFont = [System.Windows.Media.FontFamily]::new('Segoe UI Variable Text, Segoe UI')
 $icons = @{ close = 0xE711; focus = 0xE8A7; rename = 0xE8AC; resetname = 0xE7A7; pause = 0xE769; resume = 0xE768; pin = 0xE718; unpin = 0xE77A; folder = 0xE838; cwdfolder = 0xE838; copypath = 0xE8C8; copyresume = 0xE8C8
   'r-pause' = 0xE769; 'r-resume' = 0xE768; 'r-folder' = 0xE838; 'r-root' = 0xE8B7; 'r-play' = 0xE714; 'r-copy' = 0xE8C8; 'r-session' = 0xE8A7
-  'r-chan-nefralis' = 0xE8B9; 'r-chan-solrak' = 0xE8B9; 'r-chan-mrowl' = 0xE8B9; 'r-chan-auto' = 0xE72C; 'r-hide' = 0xE894; 'r-cancel' = 0xE711
-  'x-qlaunch' = 0xE768; 'x-qpause' = 0xE769; 'x-qresume' = 0xE768; 'x-qstop' = 0xE71A; 'x-qremove' = 0xE711; 'x-qfront' = 0xE74A; 'x-copycmd' = 0xE8C8; 'x-videodir' = 0xE8B7; 'x-entregado' = 0xE8A5; 'o-close' = 0xE711; 'o-kill' = 0xE7BA; 'o-folder' = 0xE838; 'o-copy' = 0xE8C8 }
+  'r-hide' = 0xE894; 'r-cancel' = 0xE711
+  'x-qlaunch' = 0xE768; 'x-qpause' = 0xE769; 'x-qresume' = 0xE768; 'x-qstop' = 0xE71A; 'x-qremove' = 0xE711; 'x-qfront' = 0xE74A; 'x-copycmd' = 0xE8C8; 'x-videodir' = 0xE8B7; 'x-entregado' = 0xE8A5; 'o-close' = 0xE711; 'o-kill' = 0xE7BA; 'o-folder' = 0xE838; 'o-copy' = 0xE8C8
+  'd-copy' = 0xE8C8; 'd-files' = 0xE8C8; 'd-folder' = 0xE838; 'd-resume' = 0xE8C8; 'd-focus' = 0xE8A7 }
 $onMenu = {
   param($sender, $e)
   $action = $sender.Tag.Action; $item = $sender.Tag.Item
@@ -2854,7 +2977,7 @@ $onMenu = {
     'r-session' { $s = $itemsByPid.Values | Where-Object { $_['SessionId'] -eq $item['Session'] } | Select-Object -First 1; if ($s) { Focus-Session $s } }
     'r-hide' { $renderStore.hidden[[string]$item['Id']] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); Save-Renders; Refresh }
     { $_ -like 'x-*' -or $_ -like 'o-*' } { Extra-Action $action $item }
-    { $_ -like 'r-chan-*' } { Set-RenderChannel $item ($action.Substring(7)) }
+    { $_ -like 'd-*' } { Diary-Action $action $item }
   }
 }
 function New-Text([string]$text, $color, [double]$size = 12, [string]$weight = 'Normal') {
@@ -3024,7 +3147,7 @@ function Show-Diary {
     $dir = ([string]$it['StartDir']).TrimEnd('').ToLower()
     if ($dir) { if ($byDir.ContainsKey($dir)) { $byDir[$dir] = $null } else { $byDir[$dir] = $it } }
   }
-  $used = @{}
+  $used = @{}; $autoHidden = 0; $script:diaryItemOf = @{}
   $shown = New-Object System.Collections.Generic.List[object]
   foreach ($d in $script:diaryAll) {
     $dirKey = ([string]$d.Cwd).TrimEnd('').ToLower()
@@ -3033,24 +3156,79 @@ function Show-Diary {
     if ($it) { if ($used.ContainsKey([int]$it['Pid'])) { $it = $null } else { $used[[int]$it['Pid']] = $true } }
     $d.Open = [bool]$it
     if ($it) { $d.Color = [string]$it['StateColor']; $d.Title = [string]$it['Title'] } else { $d.Color = '#5F6775' }
+    if ($it) { $script:diaryItemOf[$d.Id] = $it }
     if ($settings.diaryScope -eq 'open' -and -not $d.Open) { continue }
+    if ($d.Auto -and -not $d.Open -and -not $settings.diaryAuto) { $autoHidden++; continue }
     $shown.Add($d)
   }
   # Por días, del más reciente al más viejo; dentro de cada día, primero las abiertas
-  $days = [TaskMon.Diary]::ByDay($shown)
+  $query = [string]$ui.DiarySearch.Text
+  $days = [TaskMon.Diary]::ByDay($shown, $query, [int]$settings.diaryDays)
   $first = $null
   foreach ($day in $days) { foreach ($d in $day.Sessions) { if (-not $first) { $first = $d }; $d.IsExpanded = [bool]$diaryExpanded[$d.Key] } }
   if ($first -and -not $diaryExpanded.ContainsValue($true)) { $first.IsExpanded = $true }
   $ui.DiaryList.ItemsSource = $days
-  $list = $shown
-  $turns = 0; foreach ($d in $list) { $turns += $d.Raw.Count }
-  $ui.DiarySummary.Text = "Lo que has pedido cada día y lo que hizo Claude: archivos que editó, comandos y tiempo. $($list.Count) sesiones · $turns peticiones en los últimos 7 días."
-  $ui.DiaryEmpty.Visibility = $(if ($list.Count) { 'Collapsed' } else { 'Visible' })
-  $ui.DiaryEmpty.Text = $(if ($settings.diaryScope -eq 'open') { 'Ninguna sesión abierta tiene peticiones en los últimos 7 días. Prueba con «Últimos 7 días».' } else { 'No hay actividad de Claude Code en los últimos 7 días.' })
-  $ui.DiaryNote.Text = "Actualizado a las $((Get-Date).ToString('HH:mm:ss')) · clic en una sesión para ver o esconder su día a día"
+  $ids = @{}; $turns = 0
+  foreach ($day in $days) { foreach ($d in $day.Sessions) { $ids[$d.Id] = $true; $turns += $d.Raw.Count } }
+  $range = switch ([int]$settings.diaryDays) { 1 { 'hoy' } 3 { 'en los últimos 3 días' } default { 'en los últimos 7 días' } }
+  $ui.DiarySummary.Text = "Lo que has pedido cada día y lo que hizo Claude: archivos que editó, comandos y tiempo. $($ids.Count) sesiones · $turns peticiones $range$(if ($query.Trim()) { " con «$($query.Trim())»" })$(if ($autoHidden) { " · $autoHidden automáticas ocultas" })."
+  $ui.DiaryEmpty.Visibility = $(if ($days.Count) { 'Collapsed' } else { 'Visible' })
+  $ui.DiaryEmpty.Text = $(if ($query.Trim()) { "Nada $range con «$($query.Trim())»." } elseif ($settings.diaryScope -eq 'open') { "Ninguna sesión abierta tiene peticiones $range. Prueba con «Todas»." } else { "No hay actividad de Claude Code $range." })
+  $ui.DiaryNote.Text = "Actualizado a las $((Get-Date).ToString('HH:mm:ss')) · clic: abrir o cerrar · clic derecho: copiar, carpeta…"
 }
 $ui.DiaryList.AddHandler([System.Windows.Controls.Primitives.ToggleButton]::CheckedEvent, [System.Windows.RoutedEventHandler]{ param($s, $e) $d = $e.OriginalSource.DataContext; if ($d -is [TaskMon.DiarySession]) { $script:diaryExpanded[$d.Key] = $true } })
 $ui.DiaryList.AddHandler([System.Windows.Controls.Primitives.ToggleButton]::UncheckedEvent, [System.Windows.RoutedEventHandler]{ param($s, $e) $d = $e.OriginalSource.DataContext; if ($d -is [TaskMon.DiarySession]) { $script:diaryExpanded[$d.Key] = $false } })
+# Buscar: se filtra 250 ms después de la última tecla
+$diarySearchTimer = New-Object System.Windows.Threading.DispatcherTimer
+$diarySearchTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$diarySearchTimer.Add_Tick({ $diarySearchTimer.Stop(); if ($ui.DiaryBtn.IsChecked -and -not $script:diaryTask) { Show-Diary } })
+$ui.DiarySearch.Add_TextChanged({
+  $ui.DiaryHint.Visibility = $(if ($ui.DiarySearch.Text) { 'Collapsed' } else { 'Visible' })
+  $diarySearchTimer.Stop(); $diarySearchTimer.Start()
+})
+$ui.DiaryAutoChk.IsChecked = [bool]$settings.diaryAuto
+$ui.DiaryAutoChk.Add_Click({ $settings.diaryAuto = [bool]$ui.DiaryAutoChk.IsChecked; Save-Settings; if (-not $script:diaryTask) { Show-Diary } })
+function Set-Clip([string]$text, [string]$what) {
+  if (-not $text) { return }
+  try { [System.Windows.Clipboard]::SetText($text); $ui.DiaryNote.Text = "⧉ copiado: $what" } catch { $ui.DiaryNote.Text = 'no se pudo copiar (el portapapeles está ocupado)' }
+}
+# Copiar el resumen de un día
+$ui.DiaryList.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, [System.Windows.RoutedEventHandler]{
+  param($s, $e)
+  $b = $e.OriginalSource
+  if ($b.Tag -eq 'daycopy' -and $b.DataContext -is [TaskMon.DiaryDay]) { Set-Clip ([TaskMon.Diary]::DayText($b.DataContext)) "el resumen de $($b.DataContext.Header)"; $e.Handled = $true }
+})
+# Clic derecho en una petición o en una sesión del diario
+function Diary-Action([string]$action, $x) {
+  $sid = if ($x -is [TaskMon.DiaryTurn]) { [string]$x.Sid } else { [string]$x.Id }
+  $cwd = [string]$x.Cwd
+  switch ($action) {
+    'd-copy' { Set-Clip ([string]$x.Text).Trim() 'la petición' }
+    'd-files' { Set-Clip (@($x.Files) -join "`r`n") "$(@($x.Files).Count) rutas" }
+    'd-folder' { if ($cwd -and [IO.Directory]::Exists($cwd)) { Start-Process explorer.exe -ArgumentList "`"$cwd`"" } else { $ui.DiaryNote.Text = 'esa carpeta ya no existe' } }
+    'd-resume' { Set-Clip "claude --resume $sid" "claude --resume $sid" }
+    'd-focus' { $it = $script:diaryItemOf[$sid]; if ($it) { $ui.DiaryBtn.IsChecked = $false; Focus-Session $it } }
+  }
+}
+$ui.DiaryList.AddHandler([System.Windows.UIElement]::PreviewMouseRightButtonUpEvent, [System.Windows.Input.MouseButtonEventHandler]{
+  param($sender, $e)
+  $x = $e.OriginalSource.DataContext
+  if ($x -isnot [TaskMon.DiaryTurn] -and $x -isnot [TaskMon.DiarySession]) { return }
+  $e.Handled = $true
+  $menu = New-ThemedMenu
+  if ($x -is [TaskMon.DiaryTurn]) {
+    Menu-Entry $menu 'Copiar la petición' 'd-copy' $x
+    if (@($x.Files).Count) { Menu-Entry $menu "Copiar las rutas editadas ($(@($x.Files).Count))" 'd-files' $x }
+  }
+  $sid = if ($x -is [TaskMon.DiaryTurn]) { [string]$x.Sid } else { [string]$x.Id }
+  if ($script:diaryItemOf[$sid]) { Menu-Entry $menu 'Ir a su terminal' 'd-focus' $x }
+  if ($x.Cwd) { Menu-Entry $menu 'Abrir la carpeta de la sesión' 'd-folder' $x }
+  Menu-Entry $menu 'Copiar «claude --resume» de la sesión' 'd-resume' $x
+  $menu.PlacementTarget = $e.OriginalSource
+  $menu.Placement = 'MousePoint'
+  $menu.IsOpen = $true
+  $script:lastMenu = $menu
+})
 $onDiary = {
   $open = [bool]$ui.DiaryBtn.IsChecked
   if ($open) { $ui.SettingsBtn.IsChecked = $false; $ui.StageBtn.IsChecked = $false }
@@ -3083,10 +3261,10 @@ $onOption = {
   $settings[$field] = $value
   Save-Settings; Flash-Saved
   switch ($field) {
-    { $_ -in 'style', 'theme', 'nefFondo' } { Apply-Style; Log "apariencia: $($style.Name)$(if ($settings.style -eq 'hacker') { " · $($theme.Name)" })" }
+    { $_ -in 'style', 'theme' } { Apply-Style; Log "apariencia: $($style.Name)$(if ($settings.style -eq 'hacker') { " · $($theme.Name)" })" }
     'refreshSec' { $timer.Interval = [TimeSpan]::FromSeconds($value) }
     'openMode' { $ui.RamOpts.IsEnabled = ($value -eq 'ram') }
-    'diaryScope' { Show-Diary; return }
+    { $_ -in 'diaryScope', 'diaryDays' } { if (-not $script:diaryTask) { Show-Diary }; return }
     'stage' { Update-Stage $true; return }
   }
   Refresh
@@ -3138,22 +3316,12 @@ Add-Option $ui.SortOpts 'sortMode' 'recent' (Option-Text 'Último uso' 'la que t
 Add-Option $ui.SortOpts 'sortMode' 'name' (Option-Text 'Nombre' 'de la A a la Z')
 Add-Option $ui.SortOpts 'sortMode' 'memory' (Option-Text 'Memoria' 'la que más RAM usa primero')
 Add-Option $ui.DiaryScope 'diaryScope' 'open' 'Sesiones abiertas'
-Add-Option $ui.DiaryScope 'diaryScope' 'all' 'Todas las de los últimos 7 días'
+Add-Option $ui.DiaryScope 'diaryScope' 'all' 'Todas'
+Add-Option $ui.DiaryRange 'diaryDays' 1 'Hoy'
+Add-Option $ui.DiaryRange 'diaryDays' 3 '3 días'
+Add-Option $ui.DiaryRange 'diaryDays' 7 '7 días'
 foreach ($v in 10, 15, 20, 25) { Add-Option $ui.ReserveOpts 'reservePct' $v "$v%" }
 
-$nefFondos = [ordered]@{
-  estatua = 'Estatua'; partenon = 'Partenón'; biblioteca_estoica = 'Biblioteca'; olimpia = 'Olimpia'; mar_egeo = 'Mar Egeo'; amanecer_espartano = 'Esparta'
-  estoico_cosmos = 'Cosmos'; angel_caido = 'Ángel caído'; ronin = 'Ronin'; guts = 'Guts'; boxeador_manga = 'Boxeador'; muhammad_ali = 'Ali'
-}
-foreach ($k in $nefFondos.Keys) {
-  $sp = New-Object System.Windows.Controls.StackPanel; $sp.Width = 54
-  $fr = New-Object System.Windows.Controls.Border; $fr.CornerRadius = 6; $fr.Width = 48; $fr.Height = 85; $fr.HorizontalAlignment = 'Left'
-  $thumb = Asset-Image "thumb-$k.jpg"
-  if ($thumb) { $ib = New-Object System.Windows.Media.ImageBrush $thumb; $ib.Stretch = 'UniformToFill'; $fr.Background = $ib }
-  $lb = New-Object System.Windows.Controls.TextBlock; $lb.Text = $nefFondos[$k]; $lb.FontSize = 10; $lb.Margin = '0,3,0,0'; $lb.TextTrimming = 'CharacterEllipsis'
-  [void]$sp.Children.Add($fr); [void]$sp.Children.Add($lb)
-  Add-Option $ui.NefFondoOpts 'nefFondo' $k $sp
-}
 # Cada bloque de opciones va justo debajo de su estilo
 
 
@@ -3170,8 +3338,9 @@ $onCheck = {
     if ($settings.dockTerminal) { Apply-Dock $true } else { Apply-Dock $false; Apply-WindowSize $false }
   }
   if ($field -eq 'topmost') { $window.Topmost = $settings.topmost }
+  if ($field -eq 'softRender') { Apply-RenderMode; Trim-Soon }
 }
-foreach ($pair in @(@('CrtChk', 'crt'), @('SpritesChk', 'sprites'), @('SoundCritChk', 'soundCritical'), @('SoundDoneChk', 'soundDone'), @('TopChk', 'topmost'), @('FixedChk', 'fixedSize'), @('DockChk', 'dockTerminal'))) {
+foreach ($pair in @(@('CrtChk', 'crt'), @('SpritesChk', 'sprites'), @('SoundCritChk', 'soundCritical'), @('SoundDoneChk', 'soundDone'), @('TopChk', 'topmost'), @('FixedChk', 'fixedSize'), @('DockChk', 'dockTerminal'), @('SoftChk', 'softRender'))) {
   $cb = $ui[$pair[0]]; $cb.Tag = $pair[1]; $cb.IsChecked = [bool]$settings[$pair[1]]
   $cb.Add_Checked($onCheck); $cb.Add_Unchecked($onCheck)
 }
@@ -5304,6 +5473,11 @@ function Refresh {
   $procs = [TaskMon.Native]::Snapshot()
   $tree = New-Object TaskMon.Tree (, $procs)
   $byId = $tree.ById; $children = $tree.Children
+  # Cada ~5 min se olvida lo leído de procesos y archivos que ya no existen (si no, crece sin parar con cada render)
+  if ($script:tick % 60 -eq 59) {
+    foreach ($k in @($cmdCache.Keys)) { if (-not $byId.ContainsKey([int]$k)) { $cmdCache.Remove($k) } }
+    foreach ($k in @($sessionCache.Keys)) { if (-not [IO.File]::Exists($k) -or ($now.ToUniversalTime() - [IO.File]::GetLastWriteTimeUtc($k)).TotalHours -gt 25) { $sessionCache.Remove($k) } }
+  }
   $isCli = { param($p) $p -and $p.Name -eq 'claude.exe' -and [TaskMon.Native]::ImagePath($p.Pid, $p.Created) -notmatch 'AnthropicClaude|WindowsApps' }
   $roots = @($tree.Claude | Where-Object { (& $isCli $_) -and -not (& $isCli $byId[$_.Ppid]) })
 
@@ -5593,22 +5767,24 @@ function Refresh {
 # los lanzadores de Blender de FORJA que esperan su turno y la cola de vídeos de FORJA (lanzar_lote.py).
 $renderDir = Join-Path $env:USERPROFILE '.claude\render-progress'
 $rendersFile = Join-Path $dataDir 'renders.json'
-# hidden: id -> cuándo se quitó · channel: carpeta del proyecto -> canal · paused: id -> @{ since; pids } · pausedMs: id -> ms en pausa
-$renderStore = @{ hidden = @{}; channel = @{}; paused = @{}; pausedMs = @{}; launched = @{}; held = @{}; frozenWait = @{}; crashed = @{}; retries = @{}; queue = @() }
+# hidden: id -> cuándo se quitó · paused: id -> @{ since; pids } · pausedMs: id -> ms en pausa
+$renderStore = @{ hidden = @{}; paused = @{}; pausedMs = @{}; launched = @{}; held = @{}; frozenWait = @{}; crashed = @{}; retries = @{}; queue = @() }
 $rsSaved = Read-Json $rendersFile
-if ($rsSaved) { foreach ($k in 'hidden', 'channel', 'paused', 'pausedMs', 'launched', 'held', 'frozenWait', 'crashed', 'retries') { if ($rsSaved.$k) { $renderStore[$k] = To-Hashtable $rsSaved.$k } } }
+if ($rsSaved) { foreach ($k in 'hidden', 'paused', 'pausedMs', 'launched', 'held', 'frozenWait', 'crashed', 'retries') { if ($rsSaved.$k) { $renderStore[$k] = To-Hashtable $rsSaved.$k } } }
 if ($rsSaved -and $rsSaved.queue) { $renderStore.queue = @($rsSaved.queue) }
 foreach ($k in @($renderStore.held.Keys)) { $renderStore.held[$k] = To-Hashtable $renderStore.held[$k] }
 foreach ($k in @($renderStore.retries.Keys)) { if ($renderStore.retries[$k] -isnot [int] -and $renderStore.retries[$k] -isnot [long]) { $renderStore.retries.Remove($k) } }
 foreach ($k in @($renderStore.paused.Keys)) { $renderStore.paused[$k] = To-Hashtable $renderStore.paused[$k] }
 $rsSaved = $null
-function Save-Renders { try { $renderStore | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $rendersFile -Encoding UTF8 } catch {} }
-
-$channels = [ordered]@{
-  nefralis = @{ Name = 'Nefralis'; File = 'cover-nefralis.png'; Match = 'nefralis' }
-  solrak   = @{ Name = 'Solrak'; File = 'cover-solrak.png'; Match = 'solrak' }
-  mrowl    = @{ Name = 'Mr Owl'; File = 'cover-mrowl.png'; Match = 'mrowl|mr[ _-]?owl|el-ultimo-sueno|capgras' }
+# Solo se escribe si cambió algo (esto se llama en cada vuelta de la cola)
+function Save-Renders {
+  try {
+    $j = $renderStore | ConvertTo-Json -Depth 5 -Compress
+    if ($j -ceq $script:rendersSaved) { return }
+    [IO.File]::WriteAllText($rendersFile, $j, (New-Object Text.UTF8Encoding $false)); $script:rendersSaved = $j
+  } catch {}
 }
+
 $renderInfo = @{
   bundling  = @{ Label = 'PREPARANDO';      Color = '#A3A3A3' }
   rendering = @{ Label = 'RENDERIZANDO';    Color = '#3B82F6' }
@@ -5645,7 +5821,8 @@ $renderFailed = $false
 $cmdCache = @{}          # pid -> @{ Created; Cmd; Dir }
 $jobCpu = @{}            # id -> @(cpu acumulada, ms)
 $forjaCanal = @{}
-$forjaRoot = Join-Path $env:USERPROFILE 'OneDrive\Desktop\FORJA'
+# Carpeta de FORJA: la de settings.json (forjaRoot) o, si no, Escritorio\FORJA en OneDrive
+$forjaRoot = if ($settings.forjaRoot) { [string]$settings.forjaRoot } else { Join-Path $env:USERPROFILE 'OneDrive\Desktop\FORJA' }
 $glyphs = @{ video = [string][char]0xE714; blender = [string][char]0xE809; wait = [string][char]0xE916; queue = [string][char]0xE8FD; ffmpeg = [string][char]0xE8B2 }
 
 $cut = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 3 * 86400000
@@ -5666,11 +5843,8 @@ function Render-Root([string]$output) {
   }
   $d
 }
-function Render-Channel([string]$root, [string]$text) {
-  if ($root -and $renderStore.channel.ContainsKey($root)) { return [string]$renderStore.channel[$root] }
-  foreach ($k in $channels.Keys) { if ($text -match $channels[$k].Match) { return $k } }
-  ''
-}
+# Nombre corto del proyecto de un render: la carpeta donde vive
+function Project-Name([string]$root) { if ($root) { Split-Path $root.TrimEnd('\', '/') -Leaf } else { 'sin carpeta' } }
 
 # Línea de comandos y carpeta de arranque de un proceso, leídas una vez por proceso
 function Proc-Info($p) {
@@ -5800,11 +5974,7 @@ function Card-Look($card, [string]$state, [string]$chan, [string]$glyph) {
   $card['StateLabel'] = $renderInfo[$state].Label
   $card['CardBg'] = Mix-Hex $color $theme.Panel $(switch ($state) { 'paused' { 0.1 } 'error' { 0.14 } { $_ -in 'stale', 'queued', 'waiting' } { 0.06 } { $_ -in 'done', 'finished' } { 0.07 } default { 0.12 } })
   $card['Blink'] = $(if ($state -in $activeStates) { '1' } else { '0' })
-  $card['Channel'] = $chan
-  $cover = if ($chan -and $channels.Contains($chan)) { Asset-Image $channels[$chan].File } else { $null }
-  $card['Cover'] = $(if ($cover) { [System.Windows.Media.ImageSource]$cover } else { $null })
   $card['Glyph'] = $glyph
-  $card['GlyphVis'] = $(if ($cover) { 'Collapsed' } else { 'Visible' })
   $overlay = switch ($state) { 'paused' { [string][char]0xE769 } 'error' { [string][char]0xE711 } 'stale' { [string][char]0xE7BA } 'waiting' { [string][char]0xE916 } 'queued' { [string][char]0xE8FD } 'halted' { [string][char]0xE769 } 'stopped' { [string][char]0xE71A } default { '' } }
   $card['Overlay'] = $overlay
   $card['OverlayVis'] = $(if ($overlay) { 'Visible' } else { 'Collapsed' })
@@ -5895,14 +6065,6 @@ function Open-RenderFolder($item) {
   if (-not $d -and $item['Root'] -and [IO.Directory]::Exists([string]$item['Root'])) { $d = [string]$item['Root'] }
   if ($d) { Start-Process explorer.exe -ArgumentList "`"$d`"" } else { Log "no existe la carpeta de $($item['Title'])" $warn }
 }
-function Set-RenderChannel($item, [string]$ch) {
-  $root = [string]$item['Root']
-  if (-not $root) { return }
-  if ($ch -eq 'auto') { $renderStore.channel.Remove($root) } else { $renderStore.channel[$root] = $ch }
-  Save-Renders
-  Log "🖼 portada de $($item['Title']): $(if ($ch -eq 'auto') { 'automática' } else { $channels[$ch].Name })" $theme.Accent2
-  Refresh
-}
 
 # --- Una vuelta: lee todo y pone las tarjetas en sus tres listas
 function Refresh-Renders($byId, $children, [long]$nowMs) {
@@ -5954,14 +6116,13 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
     if ($alive -and $state -notin 'done', 'error', 'stale') { foreach ($x in (Tree-Pids $rpid)) { $covered[$x] = $true } }
     $fv = Forja-Video "$output $($r.title)"
     $fs = if ($fv) { Forja-State $fv } else { $null }
-    $chan = if ($root -and $renderStore.channel.ContainsKey($root)) { [string]$renderStore.channel[$root] } elseif ($fs -and $fs.Canal) { $fs.Canal } else { Render-Channel $root "$output $($r.title) $root" }
     $title = if ($output -match '[\\/]([^\\/]+\.(mp4|mov|webm|mkv))$') { $matches[1] } else { [string]$r.title }
     $total = [long]$r.total; $rendered = [long]$r.rendered; $encoded = [long]$r.encoded
     $card['Path'] = $path; $card['Pid'] = $rpid; $card['Output'] = $output; $card['Root'] = $root; $card['Blender'] = $isBlender
     $card['Session'] = [string]$r.session; $card['Title'] = $title
     $card['Mid'] = $(if ($fv) { $fv.Mid } else { '' })
     $card['CanResume'] = [bool]($r.resume -and -not $alive)
-    Card-Look $card $state $chan $glyphs.video
+    Card-Look $card $state '' $glyphs.video
     $rf = if ($total -gt 0) { [Math]::Min(1.0, $rendered / $total) } else { 0.0 }
     $ef = if ($total -gt 0) { [Math]::Min(1.0, $encoded / $total) } else { 0.0 }
     if ($state -eq 'done') { $rf = 1.0; $ef = 1.0 }
@@ -5992,7 +6153,7 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
       if ($rRate -gt 0.05) { $etaMs = ($total - $rendered) / $rRate * 1000 }
       elseif ($null -ne $r.etaMs -and -not $pausedMs) { $etaMs = [Math]::Max(0, [double]$r.etaMs - $age) }
     } elseif ($state -eq 'encoding' -and $eRate -gt 0.05) { $etaMs = ($total - $encoded) / $eRate * 1000 }
-    $chanName = if ($chan -and $channels.Contains($chan)) { $channels[$chan].Name } else { 'Sin canal' }
+    $chanName = Project-Name $root
     $fps = if ($state -eq 'encoding') { $eRate } else { $rRate }
     $card['Eta'] = switch ($state) {
       'bundling' { "$chanName · preparando el proyecto… · $(Format-Dur $runMs)" }
@@ -6021,7 +6182,7 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
     }
     $tip = @($title, "Estado: $($renderInfo[$state].Label)", "Vídeo: $output")
     if ($root) { $tip += "Proyecto: $root" }
-    $tip += "Portada: $chanName · $(if ($isBlender) { 'Blender' } else { 'Remotion' }) · $('{0:N0}' -f $pct) %"
+    $tip += "Proyecto: $chanName · $(if ($isBlender) { 'Blender' } else { 'Remotion' }) · $('{0:N0}' -f $pct) %"
     $tip += "Empezó: $(([DateTimeOffset]::FromUnixTimeMilliseconds([long]$r.startedAt)).LocalDateTime.ToString('dd/MM HH:mm')) · $(Format-Dur $runMs) de trabajo$(if ($pausedMs + $pauseNow) { " · $(Format-Dur ($pausedMs + $pauseNow)) en pausa" })"
     if ($rpid) { $tip += "PID $rpid$(if (-not $alive) { ' (ya no corre)' })" }
     $card['Tip'] = $tip -join "`n"
@@ -6088,7 +6249,6 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
     }
     $title = if ($fv) { "$($fv.Mid).mp4" } elseif ($output -match '\.(mp4|mov|mkv|webm|avi|m4v|gif)$') { Split-Path $output -Leaf } elseif ($script) { "$($j.Engine) · $script" } else { "$($j.Engine) · $(Split-Path $j.Dir -Leaf)" }
     $root = if ($fs) { $fs.Dir } elseif ($output) { Render-Root $output } else { $j.Dir }
-    $chan = if ($root -and $renderStore.channel.ContainsKey($root)) { [string]$renderStore.channel[$root] } elseif ($fs -and $fs.Canal) { $fs.Canal } else { Render-Channel $root $ctx }
     $isPaused = $renderStore.paused.ContainsKey($id)
     $state = if ($isPaused) { 'paused' } elseif ($renderResume.ContainsKey($id) -and $renderResume[$id] -gt $now) { 'resuming' } else { 'rendering' }
     $states[$id] = $state
@@ -6099,13 +6259,13 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
     $card['Pid'] = $p.Pid; $card['Output'] = $(if ($output) { $output } else { $root }); $card['Root'] = $root; $card['Title'] = $title
     $card['Cmd'] = $j.Cmd; $card['Engine'] = $j.Engine; $card['Job'] = $(if ($script) { $script } else { $j.Engine })
     $card['Mid'] = $(if ($fv) { $fv.Mid } else { '' }); $card['BpText'] = $(if ($bp) { $bp.Text } else { '' })
-    Card-Look $card $state $chan $(if ($j.Engine -eq 'Blender') { $glyphs.blender } elseif ($j.Engine -eq 'ffmpeg') { $glyphs.ffmpeg } else { $glyphs.video })
+    Card-Look $card $state '' $(if ($j.Engine -eq 'Blender') { $glyphs.blender } elseif ($j.Engine -eq 'ffmpeg') { $glyphs.ffmpeg } else { $glyphs.video })
     $pct = if ($fs -and $fs.Prog) { [double]$fs.Prog.pct } else { -1 }
     if ($bp -and $bp.Total) { $card['Bar1Label'] = 'Toma'; $card['RFrac'] = [double][Math]::Min(1.0, $bp.Done / $bp.Total); $card['RText'] = "$($bp.Done)/$($bp.Total)" }
     else { $card['Bar1Label'] = 'Vídeo'; $card['RFrac'] = $(if ($pct -ge 0) { $pct / 100 } else { 0.0 }); $card['RText'] = $(if ($pct -ge 0) { '{0:N0} %' -f $pct } else { '?' }) }
     $card['Bar2Label'] = 'CPU'; $card['EFrac'] = $(if ($null -ne $cpu) { $cpu / 100 } else { 0.0 }); $card['EText'] = $(if ($null -ne $cpu) { '{0:N0} %' -f $cpu } else { '…' })
     $runMs = ($now - $p.Created).TotalMilliseconds - [long]$renderStore.pausedMs[$id]
-    $chanName = if ($chan -and $channels.Contains($chan)) { $channels[$chan].Name } else { 'Sin canal' }
+    $chanName = Project-Name $root
     $size = ''
     if ($output -and [IO.File]::Exists($output)) { $size = " · salida $(Format-Size (New-Object IO.FileInfo $output).Length)" }
     $job = Short-Args (($j.Cmd -replace '^\s*"?[^"]*?\.exe"?\s*', ''))
@@ -6139,16 +6299,15 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
     $job = Short-Args $rest
     $title = if ($fv) { "$($fv.Mid).mp4" } else { "Blender · $job" }
     $root = if ($fs) { $fs.Dir } else { $l.Dir }
-    $chan = if ($root -and $renderStore.channel.ContainsKey($root)) { [string]$renderStore.channel[$root] } elseif ($fs -and $fs.Canal) { $fs.Canal } else { Render-Channel $root ($l.Cmd + ' ' + $l.Dir) }
     $card = Get-Card $id 'wait'
     $card.Begin()
     $card['Pid'] = $p.Pid; $card['Output'] = $root; $card['Root'] = $root; $card['Title'] = $title; $card['Cmd'] = $l.Cmd; $card['Job'] = $job
     $card['Mid'] = $(if ($fv) { $fv.Mid } else { '' })
-    Card-Look $card 'waiting' $chan $glyphs.wait
+    Card-Look $card 'waiting' '' $glyphs.wait
     $pct = if ($fs -and $fs.Prog) { [double]$fs.Prog.pct } else { -1 }
     $card['Bar1Label'] = 'Vídeo'; $card['RFrac'] = $(if ($pct -ge 0) { $pct / 100 } else { 0.0 }); $card['RText'] = $(if ($pct -ge 0) { '{0:N0} %' -f $pct } else { '?' })
     $card['Bar2Label'] = 'Turno'; $card['EFrac'] = [double](($waitList.Count - $k + 1) / [Math]::Max(1, $waitList.Count)); $card['EText'] = "#$k de $($waitList.Count)"
-    $chanName = if ($chan -and $channels.Contains($chan)) { $channels[$chan].Name } else { 'Sin canal' }
+    $chanName = Project-Name $root
     $card['Eta'] = "$chanName · esperando turno de Blender desde hace $(Format-Dur ($now - $p.Created).TotalMilliseconds) · $job"
     $card['Tip'] = (@($title, "Estado: ESPERANDO TURNO de Blender (#$k de $($waitList.Count))", "Lanzador: $launcher (PID $($p.Pid))", "Trabajo: $job", "Carpeta: $($l.Dir)") + $(if ($fs -and $fs.Prog) { @("FORJA: $($fs.Prog.fase) · $($fs.Prog.detalle)") } else { @() })) -join "`n"
     $card['Sort'] = $k
@@ -6223,13 +6382,12 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
     if ($state -eq 'queued') { $qn++ }
     $states[$id] = $state
     $seenProc[$id] = $true
-    $chan = if ($fs.Canal) { $fs.Canal } elseif ($renderStore.channel.ContainsKey($fs.Dir)) { [string]$renderStore.channel[$fs.Dir] } else { '' }
     $card = Get-Card $id 'queue'
     $card.Begin()
     $card['Pid'] = 0; $card['SessPid'] = $q.Sess; $card['Output'] = $fs.Entrega; $card['Root'] = $fs.Dir; $card['Title'] = "$mid.mp4"; $card['VideoDir'] = $fs.Dir
     $card['Mid'] = $mid; $card['Run'] = $fv.Run; $card['N'] = $fv.N; $card['Canal'] = $fs.Canal; $card['Jobs'] = $null; $card['Key'] = $q.Key
     $card['Frozen'] = $renderStore.frozenWait.ContainsKey($mid) -or ($renderStore.held[$mid] -and $renderStore.held[$mid].kind -eq 'frozen')
-    Card-Look $card $state $chan $glyphs.queue
+    Card-Look $card $state '' $glyphs.queue
     $prog = $fs.Prog
     $pct = if ($prog) { [double]$prog.pct } else { 0 }
     if (-not $prog -and $b) { $pct = [double]$b.R.rendered }
@@ -6238,7 +6396,7 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
     $fi = [Array]::IndexOf($phaseOrder, $fase)
     $card['Bar1Label'] = 'Vídeo'; $card['RFrac'] = $pct / 100; $card['RText'] = '{0:N0} %' -f $pct
     $card['Bar2Label'] = 'Fase'; $card['EFrac'] = $(if ($fi -ge 0) { ($fi + 1) / $phaseOrder.Count } else { 0.0 }); $card['EText'] = $fase
-    $chanName = if ($chan -and $channels.Contains($chan)) { $channels[$chan].Name } else { 'Sin canal' }
+    $chanName = Project-Name $fs.Dir
     $detail = if ($prog -and $prog.detalle) { [string]$prog.detalle } elseif ($b -and $b.R.note) { [string]$b.R.note } else { 'aún no empezado' }
     if ($b -and $b.R.title -match '·\s*(.+)$') { $detail = "$($matches[1]) · $detail" }
     $held = $renderStore.held[$mid]
@@ -6275,10 +6433,10 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
       $gone = $renderCards[$k2]
       # Solo cuenta como render terminado lo que duró más de un minuto y no es un trabajo de un vídeo de FORJA
       # (las validaciones de FORJA abren el mp4 con ffmpeg varias veces al acabar)
-      if ($k2 -like 'proc:*' -and -not $states.ContainsKey($k2) -and $gone -and $script:skipDone -ne $k2 -and -not $gone['Mid'] -and ($nowMs - [long]$gone['Sort']) -ge 60000) {
+      if ($k2 -like 'proc:*' -and -not $states.ContainsKey($k2) -and -not $procDone.ContainsKey($k2) -and $gone -and $script:skipDone -ne $k2 -and -not $gone['Mid'] -and ($nowMs - [long]$gone['Sort']) -ge 60000) {
         $c = $renderCards[$k2]
         $c.Begin()
-        Card-Look $c 'finished' ([string]$c['Channel']) ([string]$c['Glyph'])
+        Card-Look $c 'finished' '' ([string]$c['Glyph'])
         $c['EFrac'] = 0.0; $c['EText'] = '—'
         $c['Eta'] = "$($c['Engine']) terminó a las $($now.ToString('HH:mm'))"
         $c['Sort'] = 0 - $nowMs
@@ -6315,7 +6473,7 @@ function Refresh-Renders($byId, $children, [long]$nowMs) {
     $wts = @($jl | Where-Object { $_['Kind'] -eq 'wait' })
     $fin = @($jl | Where-Object { $_['Kind'] -eq 'render' } | Select-Object -First 1)
     $working = $fin.Count -or @($run | Where-Object { $_['State'] -ne 'paused' }).Count
-    $chanName = if ($q['Channel'] -and $channels.Contains([string]$q['Channel'])) { $channels[[string]$q['Channel']].Name } else { 'Sin canal' }
+    $chanName = Project-Name ([string]$q['Root'])
     $q.Begin()
     $q['Jobs'] = $jl.ToArray()
     $queuePos = if ($q['State'] -eq 'queued') { ([string]$q['Eta'] -split ' · ')[1] } else { '' }
@@ -6561,11 +6719,6 @@ function Relaunch-Render($item) {
 function Render-MenuInfo($menu, $item) {
   $sp = New-Object System.Windows.Controls.StackPanel; $sp.Margin = '14,6,14,6'; $sp.MaxWidth = 400
   $head = New-Object System.Windows.Controls.StackPanel; $head.Orientation = 'Horizontal'
-  if ($item['Cover']) {
-    $cv = New-Object System.Windows.Controls.Border; $cv.Width = 34; $cv.Height = 34; $cv.CornerRadius = 6; $cv.Margin = '0,0,10,0'
-    $ib = New-Object System.Windows.Media.ImageBrush $item['Cover']; $ib.Stretch = 'UniformToFill'; $cv.Background = $ib
-    [void]$head.Children.Add($cv)
-  }
   $hs = New-Object System.Windows.Controls.StackPanel; $hs.VerticalAlignment = 'Center'
   $title = New-Text ([string]$item['Title']) $theme.Bright 13.5 'SemiBold'; $title.TextTrimming = 'CharacterEllipsis'; $title.MaxWidth = 340
   [void]$hs.Children.Add($title)
@@ -6753,11 +6906,11 @@ if ($settings.homeTab -eq 'render') { $ui.NavRender.IsChecked = $true } else { S
 # Memoria: se recorta poco después de cada cosa que suelta memoria y, por si acaso, cada 3 minutos
 $trimTimer = New-Object System.Windows.Threading.DispatcherTimer
 $trimTimer.Interval = [TimeSpan]::FromSeconds(4)
-$trimTimer.Add_Tick({ $trimTimer.Stop(); [TaskMon.Native]::Trim() })
+$trimTimer.Add_Tick({ $trimTimer.Stop(); $global:Error.Clear(); [TaskMon.Native]::Trim() })
 function Trim-Soon { $trimTimer.Stop(); $trimTimer.Start() }
 $trimEvery = New-Object System.Windows.Threading.DispatcherTimer
 $trimEvery.Interval = [TimeSpan]::FromMinutes(3)
-$trimEvery.Add_Tick({ if (-not $ui.StageBtn.IsChecked) { [TaskMon.Native]::Trim() } })
+$trimEvery.Add_Tick({ $global:Error.Clear(); if (-not $ui.StageBtn.IsChecked) { [TaskMon.Native]::Trim() } })
 
 # Latido: el mod mira este archivo para no lanzar PowerShell si la ventana ya está abierta
 function Beat { try { [IO.File]::WriteAllText($aliveFile, "$PID") } catch {} }
